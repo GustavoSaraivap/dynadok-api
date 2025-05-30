@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Pipeline CI/CD – Dynadok API (Docker → ECR → ECS)
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: #usuário github
+  GitHubRepo:
+    Type: String
+    Default: dynadok-api
+  GitHubBranch:
+    Type: String
+    Default: main
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: Personal Access Token (GitHub) com permissões de leitura
+  ImageRepoName:
+    Type: String
+    Default: dynadok-api
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC onde o ECS Fargate roda
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets públicas ou privadas com NAT
+
+Resources:
+
+  ApiRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ImageRepoName
+      ImageScanningConfiguration: { ScanOnPush: true }
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  CodeBuildProjectCI:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dynadok-ci
+      Source:
+        Type: GITHUB
+        Location: !Sub https://github.com/${GitHubOwner}/${GitHubRepo}.git
+        BuildSpec: buildspec-ci.yml
+        GitCloneDepth: 1
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ImageRepoName
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ImageRepoName}
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+
+  CodeBuildProjectCD:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dynadok-cd
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-cd.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: ECR_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ImageRepoName}
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: dynadok-cluster
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: dynadok-task
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt CodeBuildServiceRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: dummy
+          PortMappings: [{ ContainerPort: 3000 }]
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Cluster
+    Properties:
+      ServiceName: dynadok-service
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref Subnets
+          SecurityGroups: []
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              OutputArtifacts: [{ Name: SourceOutput }]
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo:  !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+        - Name: Build
+          Actions:
+            - Name: BuildImage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectCI
+        - Name: Deploy
+          Actions:
+            - Name: PrepareImageDef
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: ImageDef }]
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectCD
+            - Name: ECSDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: 1
+              InputArtifacts: [{ Name: ImageDef }]
+              Configuration:
+                ClusterName: !Ref Cluster
+                ServiceName: !Ref Service
+                FileName: imagedefinitions.json
+      ArtifactStore:
+        Type: S3
+        Location: !Sub codepipeline-${AWS::Region}-${AWS::AccountId}
+
+Outputs:
+  PipelineConsoleURL:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view"
+    Description: Link para o CodePipeline

@@ -1,0 +1,10 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - export IMAGE_URI=$ECR_URI:latest
+      - printf '[{"name":"api","imageUri":"%s"}]' $IMAGE_URI > imagedefinitions.json
+artifacts:
+  files:
+    - imagedefinitions.json
